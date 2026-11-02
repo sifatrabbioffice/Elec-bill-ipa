@@ -1,0 +1,480 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Write app source files
+        run: |
+          mkdir -p src
+          cat > src/App.swift <<'SWIFT_EOF'
+          import SwiftUI
+
+          // MARK: - Models
+
+          struct Slab: Codable, Hashable {
+              var from: Double
+              var rate: Double
+          }
+
+          struct Settings: Codable {
+              var slabs: [Slab]
+              var demand: Double
+              var rent: Double
+              var vatPercent: Double
+
+              static let standard = Settings(
+                  slabs: [
+                      Slab(from: 0, rate: 5.26),
+                      Slab(from: 75, rate: 8.50),
+                      Slab(from: 200, rate: 9.10),
+                      Slab(from: 300, rate: 9.62),
+                      Slab(from: 400, rate: 15.01),
+                      Slab(from: 600, rate: 17.35)
+                  ],
+                  demand: 42,
+                  rent: 10,
+                  vatPercent: 5
+              )
+          }
+
+          struct Receipt: Codable, Identifiable {
+              var id = UUID()
+              var date: Date
+              var prev: Double
+              var current: Double
+              var units: Double
+              var energy: Double
+              var demand: Double
+              var rent: Double
+              var vat: Double
+              var total: Double
+          }
+
+          struct Calc {
+              let energy: Double
+              let demand: Double
+              let rent: Double
+              let vat: Double
+              let total: Double
+
+              init(units: Double, s: Settings) {
+                  var e = 0.0
+                  let sl = s.slabs
+                  for i in sl.indices {
+                      let lo = sl[i].from
+                      let hi = (i + 1 < sl.count) ? sl[i + 1].from : Double.greatestFiniteMagnitude
+                      let part = max(0, min(units, hi) - lo)
+                      e += part * sl[i].rate
+                  }
+                  let sub = e + s.demand + s.rent
+                  energy = e
+                  demand = s.demand
+                  rent = s.rent
+                  vat = sub * s.vatPercent / 100
+                  total = sub + sub * s.vatPercent / 100
+              }
+          }
+
+          // MARK: - Store
+
+          final class Store: ObservableObject {
+              @Published var receipts: [Receipt] = [] { didSet { persist() } }
+              @Published var settings: Settings = .standard { didSet { persist() } }
+
+              private let key = "ebill.bd.v1"
+
+              private struct Blob: Codable {
+                  var receipts: [Receipt]
+                  var settings: Settings
+              }
+
+              init() {
+                  if let d = UserDefaults.standard.data(forKey: key),
+                     let b = try? JSONDecoder().decode(Blob.self, from: d) {
+                      receipts = b.receipts
+                      settings = b.settings
+                  }
+              }
+
+              private func persist() {
+                  let b = Blob(receipts: receipts, settings: settings)
+                  if let d = try? JSONEncoder().encode(b) {
+                      UserDefaults.standard.set(d, forKey: key)
+                  }
+              }
+          }
+
+          // MARK: - Helpers
+
+          func num(_ s: String) -> Double? {
+              let t = s.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
+              return t.isEmpty ? nil : Double(t)
+          }
+
+          func fmt(_ v: Double) -> String {
+              return v == v.rounded() ? String(format: "%.0f", v) : String(format: "%.2f", v)
+          }
+
+          func money(_ v: Double) -> String {
+              return String(format: "%.2f", v)
+          }
+
+          func hideKeyboard() {
+              UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+          }
+
+          struct CardStyle: ViewModifier {
+              func body(content: Content) -> some View {
+                  content
+                      .padding(14)
+                      .frame(maxWidth: .infinity, alignment: .leading)
+                      .background(Color(.secondarySystemBackground))
+                      .clipShape(RoundedRectangle(cornerRadius: 16))
+              }
+          }
+
+          struct Tile: View {
+              let title: String
+              let value: String
+              var body: some View {
+                  VStack(spacing: 4) {
+                      Text(title).font(.caption).foregroundStyle(.secondary)
+                      Text(value).font(.headline)
+                  }
+                  .frame(maxWidth: .infinity)
+                  .padding(8)
+                  .background(Color(.tertiarySystemBackground))
+                  .clipShape(RoundedRectangle(cornerRadius: 10))
+              }
+          }
+
+          struct Row: View {
+              let label: String
+              let value: String
+              var body: some View {
+                  HStack {
+                      Text(label).foregroundStyle(.secondary)
+                      Spacer()
+                      Text(value)
+                  }
+                  .font(.subheadline)
+              }
+          }
+
+          struct TotalBox: View {
+              let total: Double
+              var body: some View {
+                  HStack {
+                      Text("মোট বিল").font(.headline)
+                      Spacer()
+                      Text("৳ \(money(total))").font(.title2.bold())
+                  }
+                  .padding(12)
+                  .background(Color.green.opacity(0.2))
+                  .clipShape(RoundedRectangle(cornerRadius: 10))
+              }
+          }
+
+          // MARK: - App
+
+          @main
+          struct EBillBDApp: App {
+              @StateObject private var store = Store()
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView().environmentObject(store)
+                  }
+              }
+          }
+
+          // MARK: - Main screen
+
+          struct ContentView: View {
+              @EnvironmentObject var store: Store
+              @State private var currentText = ""
+              @State private var prevText = ""
+              @State private var date = Date()
+              @State private var showSettings = false
+
+              var cur: Double? { num(currentText) }
+              var prv: Double? { num(prevText) }
+
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 14) {
+                              inputCard
+                              resultCard
+                              historySection
+                          }
+                          .padding()
+                      }
+                      .background(Color(.systemGroupedBackground))
+                      .navigationTitle("ইলেকট্রিক বিল BD")
+                      .toolbar {
+                          ToolbarItem(placement: .navigationBarTrailing) {
+                              Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                          }
+                          ToolbarItemGroup(placement: .keyboard) {
+                              Spacer()
+                              Button("Done") { hideKeyboard() }
+                          }
+                      }
+                      .sheet(isPresented: $showSettings) {
+                          SettingsView().environmentObject(store)
+                      }
+                      .onAppear {
+                          if prevText.isEmpty, let last = store.receipts.first {
+                              prevText = fmt(last.current)
+                          }
+                      }
+                  }
+              }
+
+              var inputCard: some View {
+                  VStack(alignment: .leading, spacing: 10) {
+                      Text("নতুন (বর্তমান) মিটার রিডিং - kWh")
+                          .font(.subheadline).foregroundStyle(.secondary)
+                      TextField("যেমন 1250", text: $currentText)
+                          .keyboardType(.decimalPad)
+                          .font(.title2.bold())
+                          .padding(10)
+                          .background(Color(.systemBackground))
+                          .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                      Text("আগের মিটার রিডিং - kWh")
+                          .font(.subheadline).foregroundStyle(.secondary)
+                      TextField("আগের রিডিং লিখুন", text: $prevText)
+                          .keyboardType(.decimalPad)
+                          .font(.title2.bold())
+                          .padding(10)
+                          .background(Color(.systemBackground))
+                          .clipShape(RoundedRectangle(cornerRadius: 10))
+                      if store.receipts.isEmpty {
+                          Text("প্রথমবার আগের রিডিং নিজে লিখুন। পরের বার থেকে নিজে থেকে বসে যাবে।")
+                              .font(.caption).foregroundStyle(.secondary)
+                      }
+
+                      DatePicker("তারিখ", selection: $date, displayedComponents: .date)
+                  }
+                  .modifier(CardStyle())
+              }
+
+              @ViewBuilder var resultCard: some View {
+                  if let p = prv, let c = cur {
+                      let u = c - p
+                      if u < 0 {
+                          Text("⚠️ নতুন রিডিং আগের রিডিং এর চেয়ে কম হতে পারে না")
+                              .foregroundStyle(.red)
+                              .modifier(CardStyle())
+                      } else {
+                          let k = Calc(units: u, s: store.settings)
+                          VStack(spacing: 10) {
+                              HStack(spacing: 8) {
+                                  Tile(title: "আগের রিডিং", value: fmt(p))
+                                  Tile(title: "নতুন রিডিং", value: fmt(c))
+                                  Tile(title: "ইউনিট", value: fmt(u))
+                              }
+                              Row(label: "এনার্জি চার্জ", value: "৳ \(money(k.energy))")
+                              Row(label: "ডিমান্ড চার্জ", value: "৳ \(money(k.demand))")
+                              Row(label: "মিটার ভাড়া", value: "৳ \(money(k.rent))")
+                              Row(label: "ভ্যাট (\(fmt(store.settings.vatPercent))%)", value: "৳ \(money(k.vat))")
+                              TotalBox(total: k.total)
+                              Button { saveReceipt() } label: {
+                                  Label("রিসিট সেভ করো", systemImage: "square.and.arrow.down")
+                                      .frame(maxWidth: .infinity)
+                              }
+                              .buttonStyle(.borderedProminent)
+                          }
+                          .modifier(CardStyle())
+                      }
+                  }
+              }
+
+              var historySection: some View {
+                  VStack(alignment: .leading, spacing: 10) {
+                      Text("রিসিট হিস্টোরি").font(.title3.bold())
+                      if store.receipts.isEmpty {
+                          Text("এখনো কোনো রিসিট নেই।").foregroundStyle(.secondary)
+                      }
+                      ForEach(store.receipts) { r in
+                          ReceiptCard(r: r) {
+                              store.receipts.removeAll { $0.id == r.id }
+                          }
+                      }
+                  }
+                  .frame(maxWidth: .infinity, alignment: .leading)
+              }
+
+              func saveReceipt() {
+                  guard let c = cur, let p = prv, c >= p else { return }
+                  let u = c - p
+                  let k = Calc(units: u, s: store.settings)
+                  let r = Receipt(date: date, prev: p, current: c, units: u,
+                                  energy: k.energy, demand: k.demand, rent: k.rent,
+                                  vat: k.vat, total: k.total)
+                  store.receipts.insert(r, at: 0)
+                  prevText = fmt(c)
+                  currentText = ""
+                  date = Date()
+                  hideKeyboard()
+              }
+          }
+
+          // MARK: - Receipt card
+
+          struct ReceiptCard: View {
+              let r: Receipt
+              let onDelete: () -> Void
+
+              var body: some View {
+                  VStack(spacing: 10) {
+                      HStack {
+                          Text(r.date, format: .dateTime.day().month(.wide).year())
+                              .font(.headline)
+                          Spacer()
+                          Button(role: .destructive) { onDelete() } label: {
+                              Image(systemName: "trash")
+                          }
+                      }
+                      HStack(spacing: 8) {
+                          Tile(title: "আগের রিডিং", value: fmt(r.prev))
+                          Tile(title: "নতুন রিডিং", value: fmt(r.current))
+                          Tile(title: "ইউনিট", value: fmt(r.units))
+                      }
+                      Row(label: "এনার্জি চার্জ", value: "৳ \(money(r.energy))")
+                      Row(label: "ডিমান্ড চার্জ", value: "৳ \(money(r.demand))")
+                      Row(label: "মিটার ভাড়া", value: "৳ \(money(r.rent))")
+                      Row(label: "ভ্যাট", value: "৳ \(money(r.vat))")
+                      TotalBox(total: r.total)
+                  }
+                  .modifier(CardStyle())
+              }
+          }
+
+          // MARK: - Settings
+
+          struct SettingsView: View {
+              @EnvironmentObject var store: Store
+              @Environment(\.dismiss) var dismiss
+
+              func label(_ i: Int) -> String {
+                  let s = store.settings.slabs
+                  let lo = fmt(s[i].from)
+                  if i + 1 < s.count {
+                      return "\(lo) – \(fmt(s[i + 1].from)) ইউনিট"
+                  }
+                  return "\(lo)+ ইউনিট"
+              }
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section("স্ল্যাব রেট (Tk / ইউনিট)") {
+                              ForEach(store.settings.slabs.indices, id: \.self) { i in
+                                  HStack {
+                                      Text(label(i))
+                                      Spacer()
+                                      TextField("rate", value: $store.settings.slabs[i].rate, format: .number)
+                                          .keyboardType(.decimalPad)
+                                          .multilineTextAlignment(.trailing)
+                                          .frame(width: 90)
+                                  }
+                              }
+                          }
+                          Section("অন্যান্য চার্জ") {
+                              HStack {
+                                  Text("ডিমান্ড চার্জ (Tk)")
+                                  Spacer()
+                                  TextField("demand", value: $store.settings.demand, format: .number)
+                                      .keyboardType(.decimalPad)
+                                      .multilineTextAlignment(.trailing)
+                                      .frame(width: 90)
+                              }
+                              HStack {
+                                  Text("মিটার ভাড়া (Tk)")
+                                  Spacer()
+                                  TextField("rent", value: $store.settings.rent, format: .number)
+                                      .keyboardType(.decimalPad)
+                                      .multilineTextAlignment(.trailing)
+                                      .frame(width: 90)
+                              }
+                              HStack {
+                                  Text("ভ্যাট (%)")
+                                  Spacer()
+                                  TextField("vat", value: $store.settings.vatPercent, format: .number)
+                                      .keyboardType(.decimalPad)
+                                      .multilineTextAlignment(.trailing)
+                                      .frame(width: 90)
+                              }
+                          }
+                          Section {
+                              Button("ডিফল্ট রেট ফিরিয়ে আনো") { store.settings = .standard }
+                          }
+                          Section {
+                              Text("রেট বদলালে আগের সেভ করা রিসিট বদলাবে না, শুধু নতুন হিসাবে প্রযোজ্য হবে।")
+                                  .font(.caption).foregroundStyle(.secondary)
+                          }
+                      }
+                      .navigationTitle("সেটিংস")
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Done") { dismiss() }
+                          }
+                      }
+                  }
+              }
+          }
+          SWIFT_EOF
+          cat > src/Info.plist <<'PLIST_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>EBillBD</string>
+            <key>CFBundleIdentifier</key><string>com.example.ebillbd</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>Electric Bill BD</string>
+            <key>CFBundleDisplayName</key><string>Electric Bill BD</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+            <key>MinimumOSVersion</key><string>16.0</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+            <key>UILaunchScreen</key><dict/>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+          </dict>
+          </plist>
+          PLIST_EOF
+
+      - name: Build unsigned IPA
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP=build/Payload/EBillBD.app
+          mkdir -p "$APP"
+          xcrun --sdk iphoneos swiftc \
+            -sdk "$SDK" \
+            -target arm64-apple-ios16.0 \
+            -O -parse-as-library \
+            -module-name EBillBD \
+            src/App.swift \
+            -o "$APP/EBillBD"
+          cp src/Info.plist "$APP/Info.plist"
+          plutil -lint "$APP/Info.plist"
+          cd build
+          zip -qry EBillBD.ipa Payload
+          ls -lh EBillBD.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: EBillBD-unsigned-ipa
+          path: build/EBillBD.ipa
